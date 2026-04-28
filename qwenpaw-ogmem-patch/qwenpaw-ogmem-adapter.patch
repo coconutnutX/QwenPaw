@@ -1,0 +1,699 @@
+From 6a5c1a17acdd963c00d1272412ef3314991a90fc Mon Sep 17 00:00:00 2001
+From: coconutnutx <coconutnutxs@gmail.com>
+Date: Tue, 28 Apr 2026 11:28:04 +0800
+Subject: [PATCH] feat(memory+context): add oG-Memory adapters for QwenPaw
+
+Add OGMemoryMemoryManager (session owner, 5 POST helpers, after_turn/compact public API)
+and OGMemoryContextManager (BaseContextManager subclass, delegates to mm).
+Also fix PROVIDER_OPENAI to read OPENAI_BASE_URL from env.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/qwenpaw/agents/context/__init__.py        |   2 +
+ .../agents/context/ogmem_context_manager.py   | 210 +++++++++
+ src/qwenpaw/agents/memory/__init__.py         |   2 +
+ .../agents/memory/ogmem_memory_manager.py     | 399 ++++++++++++++++++
+ src/qwenpaw/providers/provider_manager.py     |   4 +-
+ 5 files changed, 615 insertions(+), 2 deletions(-)
+ create mode 100644 src/qwenpaw/agents/context/ogmem_context_manager.py
+ create mode 100644 src/qwenpaw/agents/memory/ogmem_memory_manager.py
+
+diff --git a/src/qwenpaw/agents/context/__init__.py b/src/qwenpaw/agents/context/__init__.py
+index 209ec930..50b2be67 100644
+--- a/src/qwenpaw/agents/context/__init__.py
++++ b/src/qwenpaw/agents/context/__init__.py
+@@ -6,6 +6,7 @@ from .as_msg_handler import AsMsgHandler
+ from .as_msg_stat import AsBlockStat, AsMsgStat
+ from .base_context_manager import BaseContextManager
+ from .light_context_manager import LightContextManager
++from .ogmem_context_manager import OGMemoryContextManager  # noqa: F401
+ 
+ __all__ = [
+     "AgentContext",
+@@ -14,4 +15,5 @@ __all__ = [
+     "AsMsgStat",
+     "BaseContextManager",
+     "LightContextManager",
++    "OGMemoryContextManager",
+ ]
+diff --git a/src/qwenpaw/agents/context/ogmem_context_manager.py b/src/qwenpaw/agents/context/ogmem_context_manager.py
+new file mode 100644
+index 00000000..28b2179d
+--- /dev/null
++++ b/src/qwenpaw/agents/context/ogmem_context_manager.py
+@@ -0,0 +1,210 @@
++# -*- coding: utf-8 -*-
++"""oG-Memory context manager for QwenPaw agents.
++
++Setup (assuming QwenPaw and oG-Memory service are already installed):
++  1. Set ``context_manager_backend`` and ``memory_manager_backend`` both to
++     ``"ogmem"`` in ``~/.qwenpaw/workspaces/<agent_id>/agent.json``,
++     under the ``"running"`` section.
++  2. Set environment variables (optional, defaults shown):
++       OGMEMORY_URL=http://localhost:8090
++       OGMEMORY_ACCOUNT_ID=default
++       OGMEMORY_USER_ID=<agent_id>
++  3. Start oG-Memory service (port 8090 by default).
++  4. Start QwenPaw.
++
++Verify via logs — look for these markers:
++  [ogmem] session started:<id>          — mm bootstrapped ok
++  [ogmem-ctx] cached memory_manager     — ctx linked to mm
++  [ogmem] POST /api/v1/compose          — memory retrieval
++  [ogmem] POST /api/v1/after_turn       — message persistence
++
++Architecture:
++  Inherits BaseContextManager
++  Does NOT own session_id or HTTP client — all ogmem interaction
++  goes through agent.memory_manager (OGMemoryMemoryManager)
++
++  pre_reply()       → no-op
++  pre_reasoning()   → mm.retrieve()  → POST /compose
++  post_acting()     → mm.after_turn() → POST /after_turn
++  post_reply()      → mm.after_turn() → POST /after_turn
++  compact_context() → mm.compact()    → POST /compact
++"""
++import logging
++from typing import Any
++
++from agentscope.message import Msg
++
++from ...config.config import load_agent_config
++from ..utils.token_counter import get_token_counter
++from .agent_context import AgentContext
++from .base_context_manager import BaseContextManager, context_registry
++
++logger = logging.getLogger(__name__)
++
++
++@context_registry.register("ogmem")
++class OGMemoryContextManager(BaseContextManager):
++    """Context manager backed by oG-Memory via memory_manager delegation.
++
++    Lazily caches agent.memory_manager on first hook call that needs it.
++    This avoids modifying workspace.py — the alternative would be injecting
++    memory_manager via workspace's post_init callback, which couples
++    ogmem-specific logic into the generic workspace layer.
++    """
++
++    def __init__(self, working_dir: str, agent_id: str):
++        super().__init__(working_dir=working_dir, agent_id=agent_id)
++        self.ogmem_mm = None       # lazily cached from agent.memory_manager
++        self._last_sent_idx = 0    # track messages already sent to ogmem
++
++    # ------------------------------------------------------------------
++    # Helpers
++    # ------------------------------------------------------------------
++
++    def _ogmem_mm(self, agent: Any):
++        """Return cached OGMemoryMemoryManager, lazily resolved from agent.
++
++        Resolves agent.memory_manager once, logs a warning if it's not
++        OGMemoryMemoryManager.  Callers wrapped in try/except handle the
++        None case gracefully.
++        """
++        if self.ogmem_mm is None:
++            from ..memory.ogmem_memory_manager import OGMemoryMemoryManager
++
++            mm = getattr(agent, "memory_manager", None)
++            if isinstance(mm, OGMemoryMemoryManager):
++                self.ogmem_mm = mm
++                logger.info(
++                    "[ogmem-ctx] cached memory_manager, session=%s",
++                    mm._session_id,
++                )
++            else:
++                logger.warning(
++                    "[ogmem-ctx] agent.memory_manager is %s, "
++                    "expected OGMemoryMemoryManager",
++                    type(mm).__name__ if mm else "None",
++                )
++        return self.ogmem_mm
++
++    def _new_messages(self, agent: Any) -> list[Msg]:
++        """Return messages added since last after_turn call."""
++        memory = agent.memory
++        msgs = [msg for msg, _ in memory.content]
++        new = msgs[self._last_sent_idx:]
++        self._last_sent_idx = len(msgs)
++        return new
++
++    # ------------------------------------------------------------------
++    # Lifecycle: start / close
++    # ------------------------------------------------------------------
++
++    async def start(self) -> None:
++        """No-op. mm owns bootstrap."""
++
++    async def close(self) -> bool:
++        """No-op. mm owns dispose."""
++        self.ogmem_mm = None
++        return True
++
++    # ------------------------------------------------------------------
++    # Agent lifecycle hooks
++    # ------------------------------------------------------------------
++
++    async def pre_reply(
++        self,
++        agent: Any,
++        kwargs: dict[str, Any],
++    ) -> dict[str, Any] | None:
++        """No-op."""
++        return None
++
++    async def pre_reasoning(
++        self,
++        agent: Any,
++        kwargs: dict[str, Any],
++    ) -> dict[str, Any] | None:
++        """Retrieve relevant memories before each reasoning step."""
++        msg = kwargs.get("msg")
++        if msg is None:
++            return None
++        try:
++            return await self._ogmem_mm(agent).retrieve(
++                msg, agent_name=agent.name,
++            )
++        except Exception:
++            logger.exception("[ogmem-ctx] pre_reasoning failed")
++            return None
++
++    async def post_acting(
++        self,
++        agent: Any,
++        kwargs: dict[str, Any],
++        output: Any,
++    ) -> Msg | None:
++        """Persist tool interaction to oG-Memory after each acting step."""
++        new_msgs = self._new_messages(agent)
++        if not new_msgs:
++            return None
++        try:
++            await self._ogmem_mm(agent).after_turn(new_msgs)
++        except Exception:
++            logger.exception("[ogmem-ctx] post_acting failed")
++        return None
++
++    async def post_reply(
++        self,
++        agent: Any,
++        kwargs: dict[str, Any],
++        output: Any,
++    ) -> Msg | None:
++        """Persist final reply to oG-Memory."""
++        new_msgs = self._new_messages(agent)
++        if not new_msgs:
++            return None
++        try:
++            await self._ogmem_mm(agent).after_turn(new_msgs)
++        except Exception:
++            logger.exception("[ogmem-ctx] post_reply failed")
++        return None
++
++    # ------------------------------------------------------------------
++    # Agent context
++    # ------------------------------------------------------------------
++
++    def get_agent_context(self, **kwargs) -> AgentContext:
++        """Create local AgentContext with token counting support."""
++        agent_config = load_agent_config(self.agent_id)
++        return AgentContext(
++            token_counter=get_token_counter(agent_config),
++        )
++
++    # ------------------------------------------------------------------
++    # Compaction
++    # ------------------------------------------------------------------
++
++    async def compact_context(
++        self,
++        messages: list[Msg],
++        previous_summary: str = "",
++        extra_instruction: str = "",
++    ) -> dict:
++        """Delegate to ogmem_mm.compact() for server-side compaction."""
++        if self.ogmem_mm is None:
++            return {
++                "success": False,
++                "reason": "memory_manager not initialized",
++                "history_compact": "",
++                "before_tokens": 0,
++                "after_tokens": 0,
++            }
++        try:
++            return await self.ogmem_mm.compact()
++        except Exception:
++            logger.exception("[ogmem-ctx] compact_context failed")
++            return {
++                "success": False,
++                "reason": "compact failed",
++                "history_compact": "",
++                "before_tokens": 0,
++                "after_tokens": 0,
++            }
+diff --git a/src/qwenpaw/agents/memory/__init__.py b/src/qwenpaw/agents/memory/__init__.py
+index 9b6eac85..d78654b0 100644
+--- a/src/qwenpaw/agents/memory/__init__.py
++++ b/src/qwenpaw/agents/memory/__init__.py
+@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
+ 
+ from .agent_md_manager import AgentMdManager
+ from .base_memory_manager import BaseMemoryManager
++from .ogmem_memory_manager import OGMemoryMemoryManager  # noqa: F401
+ from .reme_light_memory_manager import ReMeLightMemoryManager
+ 
+ # Proactive symbols are lazily re-exported via __getattr__ at runtime to
+@@ -27,6 +28,7 @@ if TYPE_CHECKING:  # pragma: no cover
+ __all__ = [
+     "AgentMdManager",
+     "BaseMemoryManager",
++    "OGMemoryMemoryManager",
+     "ReMeLightMemoryManager",
+     # proactive symbols resolved lazily at runtime via __getattr__
+     "ProactiveConfig",
+diff --git a/src/qwenpaw/agents/memory/ogmem_memory_manager.py b/src/qwenpaw/agents/memory/ogmem_memory_manager.py
+new file mode 100644
+index 00000000..4b8fa0fc
+--- /dev/null
++++ b/src/qwenpaw/agents/memory/ogmem_memory_manager.py
+@@ -0,0 +1,399 @@
++# -*- coding: utf-8 -*-
++"""oG-Memory HTTP adapter for QwenPaw memory manager.
++
++Owns session_id and HTTP client — the sole point of contact with the
++oG-Memory HTTP service.  OGMemoryContextManager delegates here for all
++ogmem interactions.
++
++Public API used by context_manager:
++  after_turn(messages) → POST /after_turn
++  compact()           → POST /compact
++  retrieve(messages)  → POST /compose (via memory_search)
++"""
++import json
++import logging
++import os
++import uuid
++from collections.abc import Callable
++
++import httpx
++from agentscope.message import Msg, TextBlock, ToolResultBlock, ToolUseBlock
++from agentscope.tool import ToolResponse
++
++from .base_memory_manager import BaseMemoryManager, memory_registry
++
++logger = logging.getLogger(__name__)
++
++OGMEM_MEMORY_GUIDANCE_ZH = """\
++## 记忆
++
++你可以使用 `memory_search` 工具搜索长期记忆。在回答关于过往工作、决策、偏好、
++待办的问题前，先用 `memory_search` 检索相关记忆。
++
++重要信息会自动从对话中提取并持久化，无需手动保存。"""
++
++OGMEM_MEMORY_GUIDANCE_EN = """\
++## Memory
++
++You can use the `memory_search` tool to search long-term memory. Before answering
++questions about past work, decisions, preferences, or todos, use `memory_search`
++to retrieve relevant memories.
++
++Important information is automatically extracted from conversations and persisted.
++No manual saving needed."""
++
++
++def _msg_to_dict(msg: Msg) -> dict:
++    """Convert an AgentScope Msg to a {role, content} dict for oG-Memory."""
++    content = msg.content
++    if isinstance(content, list):
++        text_parts: list[str] = []
++        for block in content:
++            if isinstance(block, dict):
++                if block.get("type") == "text":
++                    text_parts.append(block.get("text", ""))
++                elif block.get("type") == "tool_use":
++                    text_parts.append(
++                        f"[tool: {block.get('name')}] "
++                        f"{json.dumps(block.get('input', {}), ensure_ascii=False)}",
++                    )
++                elif block.get("type") == "tool_result":
++                    outputs = block.get("output", [])
++                    if isinstance(outputs, list):
++                        for o in outputs:
++                            if isinstance(o, dict) and o.get("type") == "text":
++                                text_parts.append(o.get("text", ""))
++            elif isinstance(block, str):
++                text_parts.append(block)
++        content = "\n".join(text_parts)
++    return {"role": msg.role, "content": content or ""}
++
++
++@memory_registry.register("ogmem")
++class OGMemoryMemoryManager(BaseMemoryManager):
++    """Memory manager backed by oG-Memory HTTP service.
++
++    Delegates lifecycle, search, and persistence to an oG-Memory instance
++    via its REST API.  Owns the session_id and HTTP client.
++    """
++
++    def __init__(self, working_dir: str, agent_id: str):
++        super().__init__(working_dir=working_dir, agent_id=agent_id)
++        self._base_url = os.environ.get(
++            "OGMEMORY_URL", "http://localhost:8090",
++        )
++        self._account_id = os.environ.get("OGMEMORY_ACCOUNT_ID", "default")
++        self._user_id = os.environ.get("OGMEMORY_USER_ID", agent_id)
++        self._session_id = uuid.uuid4().hex
++        self._http: httpx.AsyncClient | None = None
++        logger.info(
++            "[ogmem] init: agent_id=%s, base_url=%s, session=%s",
++            agent_id, self._base_url, self._session_id,
++        )
++
++    # ------------------------------------------------------------------
++    # Helpers
++    # ------------------------------------------------------------------
++
++    def _base_params(self) -> dict:
++        return {
++            "sessionId": self._session_id,
++            "accountId": self._account_id,
++            "userId": self._user_id,
++            "agentId": self.agent_id,
++        }
++
++    # ------------------------------------------------------------------
++    # POST helpers — one per oG-Memory API
++    # ------------------------------------------------------------------
++
++    async def _post_bootstrap(self) -> dict:
++        """POST /api/v1/bootstrap"""
++        params = self._base_params()
++        logger.info("[ogmem] POST /api/v1/bootstrap params=%s", params)
++        resp = await self._http.post("/api/v1/bootstrap", json=params)
++        logger.info(
++            "[ogmem] POST /api/v1/bootstrap => status=%s body=%s",
++            resp.status_code, resp.text[:300],
++        )
++        resp.raise_for_status()
++        return resp.json()
++
++    async def _post_dispose(self) -> None:
++        """POST /api/v1/dispose"""
++        params = self._base_params()
++        logger.info("[ogmem] POST /api/v1/dispose params=%s", params)
++        try:
++            resp = await self._http.post("/api/v1/dispose", json=params)
++            logger.info(
++                "[ogmem] POST /api/v1/dispose => status=%s body=%s",
++                resp.status_code, resp.text[:300],
++            )
++        except Exception:
++            logger.exception("[ogmem] dispose request failed")
++
++    async def _post_after_turn(self, msg_dicts: list[dict]) -> dict:
++        """POST /api/v1/after_turn — accumulate messages, maybe extract."""
++        params = {**self._base_params(), "messages": msg_dicts}
++        log_params = {k: v for k, v in params.items() if k != "messages"}
++        log_params["message_count"] = len(msg_dicts)
++        logger.info("[ogmem] POST /api/v1/after_turn params=%s", log_params)
++        resp = await self._http.post("/api/v1/after_turn", json=params)
++        logger.info(
++            "[ogmem] POST /api/v1/after_turn => status=%s body=%s",
++            resp.status_code, resp.text[:500],
++        )
++        resp.raise_for_status()
++        return resp.json()
++
++    async def _post_compact(self, token_budget: int = 128_000) -> dict:
++        """POST /api/v1/compact — force extract + archive, return summary."""
++        params = {**self._base_params(), "tokenBudget": token_budget}
++        logger.info("[ogmem] POST /api/v1/compact params=%s", params)
++        resp = await self._http.post("/api/v1/compact", json=params)
++        logger.info(
++            "[ogmem] POST /api/v1/compact => status=%s body=%s",
++            resp.status_code, resp.text[:500],
++        )
++        resp.raise_for_status()
++        return resp.json()
++
++    async def _post_compose(self, query: str) -> dict:
++        """POST /api/v1/compose — search memories, assemble context."""
++        params = {**self._base_params(), "prompt": query, "messages": []}
++        logger.info("[ogmem] POST /api/v1/compose query=%r", query)
++        resp = await self._http.post("/api/v1/compose", json=params)
++        logger.info(
++            "[ogmem] POST /api/v1/compose => status=%s body=%s",
++            resp.status_code, resp.text[:500],
++        )
++        resp.raise_for_status()
++        return resp.json()
++
++    # ------------------------------------------------------------------
++    # Public methods for context_manager delegation
++    # ------------------------------------------------------------------
++
++    async def after_turn(self, messages: list[Msg]) -> str:
++        """Persist messages to oG-Memory buffer.
++
++        Called by OGMemoryContextManager.post_acting() and post_reply().
++        Accumulates messages in server-side buffer; extraction is
++        threshold-based.
++        """
++        if not self._http:
++            return ""
++        dicts = [_msg_to_dict(m) for m in messages]
++        data = await self._post_after_turn(dicts)
++        return (
++            f"oG-Memory: extracted={data.get('candidates_extracted', 0)}, "
++            f"written={data.get('writes_completed', 0)}"
++        )
++
++    async def compact(self) -> dict:
++        """Force compact oG-Memory buffer. Returns standard compact result.
++
++        Called by OGMemoryContextManager.compact_context().
++        If buffer is empty (already extracted by after_turn), returns
++        success=False.
++        """
++        if not self._http:
++            return {
++                "success": False, "reason": "not connected",
++                "history_compact": "", "before_tokens": 0,
++                "after_tokens": 0,
++            }
++        data = await self._post_compact()
++        if not data.get("ok") or not data.get("compacted"):
++            return {
++                "success": False,
++                "reason": data.get("reason", "not compacted"),
++                "history_compact": "", "before_tokens": 0,
++                "after_tokens": 0,
++            }
++        result = data.get("result", {})
++        summary = result.get("summary", "")
++        return {
++            "success": bool(summary),
++            "reason": "" if summary else "empty summary",
++            "history_compact": summary,
++            "before_tokens": result.get("tokensBefore", 0),
++            "after_tokens": result.get("tokensAfter", 0),
++        }
++
++    # ------------------------------------------------------------------
++    # BaseMemoryManager interface — abstract methods
++    # ------------------------------------------------------------------
++
++    async def start(self) -> None:
++        """Create HTTP client, health check, bootstrap session."""
++        self._http = httpx.AsyncClient(
++            base_url=self._base_url,
++            timeout=httpx.Timeout(30.0, connect=5.0),
++        )
++        resp = await self._http.get("/api/v1/health")
++        logger.info(
++            "[ogmem] GET /api/v1/health => status=%s body=%s",
++            resp.status_code, resp.text[:200],
++        )
++        resp.raise_for_status()
++        if resp.json().get("status") != "ok":
++            raise RuntimeError(f"oG-Memory unhealthy: {resp.json()}")
++
++        await self._post_bootstrap()
++        logger.info("[ogmem] session started: %s", self._session_id)
++
++    async def close(self) -> bool:
++        """Dispose session and close HTTP client."""
++        if self._http:
++            await self._post_dispose()
++            await self._http.aclose()
++            self._http = None
++        return True
++
++    def get_memory_prompt(self, language: str = "zh") -> str:
++        prompts = {"zh": OGMEM_MEMORY_GUIDANCE_ZH, "en": OGMEM_MEMORY_GUIDANCE_EN}
++        return prompts.get(language, OGMEM_MEMORY_GUIDANCE_EN)
++
++    def list_memory_tools(self) -> list[Callable[..., ToolResponse]]:
++        return [self.memory_search]
++
++    # ------------------------------------------------------------------
++    # BaseMemoryManager interface — optional overrides
++    # ------------------------------------------------------------------
++
++    async def summarize(self, messages: list[Msg], **kwargs) -> str:
++        """oG-Memory has no native 'summarize' API. We use:
++        1. after_turn — accumulate messages + threshold-based extraction
++        2. compact — force extract if after_turn didn't trigger
++
++        Note: if after_turn already triggered extraction and cleared the
++        buffer, compact will find nothing. This is expected and not an
++        error.
++        """
++        if not self._http:
++            return ""
++        dicts = [_msg_to_dict(m) for m in messages]
++        await self._post_after_turn(dicts)
++        compact_data = await self._post_compact()
++        summary = compact_data.get("result", {}).get("summary", "")
++        return summary
++
++    async def retrieve(
++        self,
++        messages: list[Msg] | Msg,
++        agent_name: str = "",
++        **kwargs,
++    ) -> dict | None:
++        """Retrieve relevant memory and return updated kwargs dict."""
++        if not self._http:
++            return None
++
++        msgs: list[Msg] = (
++            [messages] if isinstance(messages, Msg) else list(messages)
++        )
++
++        # Build query from newest messages
++        query_parts: list[str] = []
++        total = 0
++        for msg in reversed(msgs):
++            text = (msg.get_text_content() or "").strip()
++            if not text:
++                continue
++            remaining = 100 - total
++            if remaining <= 0:
++                break
++            chunk = text[:remaining]
++            query_parts.insert(0, chunk)
++            total += len(chunk)
++
++        query = " ".join(query_parts).strip()
++        if not query:
++            return None
++
++        try:
++            result = await self.memory_search(query=query)
++            text_content = "\n".join(
++                b.get("text", "")
++                for b in result.content
++                if isinstance(b, dict) and b.get("text")
++            )
++            if not text_content:
++                return None
++
++            _id = uuid.uuid4().hex
++            tool_input = {"query": query}
++            assistant_msg = Msg(
++                name=agent_name,
++                role="assistant",
++                content=[
++                    TextBlock(type="text", text="Searching memory..."),
++                    ToolUseBlock(
++                        type="tool_use",
++                        id=_id,
++                        name="memory_search",
++                        input=tool_input,
++                        raw_input=json.dumps(tool_input, ensure_ascii=False),
++                    ),
++                ],
++            )
++            tool_result_msg = Msg(
++                name=agent_name,
++                role="system",
++                content=[
++                    ToolResultBlock(
++                        type="tool_result",
++                        id=_id,
++                        name="memory_search",
++                        output=[TextBlock(type="text", text=text_content)],
++                    ),
++                ],
++            )
++            return {"msg": msgs + [assistant_msg, tool_result_msg]}
++        except Exception:
++            logger.exception("[ogmem] retrieve failed")
++            return None
++
++    # ------------------------------------------------------------------
++    # Tool method — registered with agent toolkit
++    # ------------------------------------------------------------------
++
++    async def memory_search(
++        self,
++        query: str,
++        max_results: int = 5,
++        min_score: float = 0.1,
++    ) -> ToolResponse:
++        """Search memories semantically via oG-Memory.
++
++        Args:
++            query: The semantic search query.
++            max_results: Maximum results (unused by oG-Memory).
++            min_score: Minimum similarity (unused by oG-Memory).
++
++        Returns:
++            ToolResponse with search results.
++        """
++        if not self._http:
++            return ToolResponse(
++                content=[TextBlock(type="text", text="oG-Memory not started")],
++            )
++        try:
++            data = await self._post_compose(query)
++            parts = [
++                data[f].strip()
++                for f in (
++                    "identityContext", "retrievedEvidence",
++                    "episodicContext", "sessionContext",
++                )
++                if data.get(f, "").strip()
++            ]
++            text = "\n\n---\n\n".join(parts) or "未找到相关记忆。"
++            return ToolResponse(
++                content=[TextBlock(type="text", text=text)],
++            )
++        except Exception:
++            logger.exception("[ogmem] memory_search failed")
++            return ToolResponse(
++                content=[TextBlock(type="text", text="记忆搜索失败。")],
++            )
+diff --git a/src/qwenpaw/providers/provider_manager.py b/src/qwenpaw/providers/provider_manager.py
+index 81cf4d6c..df837714 100644
+--- a/src/qwenpaw/providers/provider_manager.py
++++ b/src/qwenpaw/providers/provider_manager.py
+@@ -589,10 +589,10 @@ PROVIDER_QWENPAW = OpenAIProvider(
+ PROVIDER_OPENAI = OpenAIProvider(
+     id="openai",
+     name="OpenAI",
+-    base_url="https://api.openai.com/v1",
++    base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+     api_key_prefix="sk-",
+     models=OPENAI_MODELS,
+-    freeze_url=True,
++    freeze_url=False,
+ )
+ 
+ PROVIDER_OPENCODE = OpenAIProvider(
+-- 
+2.43.0
+
