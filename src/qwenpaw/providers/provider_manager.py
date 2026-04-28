@@ -589,10 +589,10 @@ PROVIDER_QWENPAW = OpenAIProvider(
 PROVIDER_OPENAI = OpenAIProvider(
     id="openai",
     name="OpenAI",
-    base_url="https://api.openai.com/v1",
+    base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
     api_key_prefix="sk-",
     models=OPENAI_MODELS,
-    freeze_url=True,
+    freeze_url=False,
 )
 
 PROVIDER_OPENCODE = OpenAIProvider(
